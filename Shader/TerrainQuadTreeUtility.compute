@@ -1,0 +1,157 @@
+#ifndef _TerrainNodeAABB_
+#define _TerrainNodeAABB_
+
+#pragma kernel CSGenerateHeightRangeMip0;
+#pragma kernel CSGenerateHeightRangeMipDown;
+
+#pragma kernel CSGenerateTerrainNodeAABBBuffer;
+
+#pragma kernel CSGenerateTerrainNodeDataBuffer;
+
+#include "ClipmapTerrainCommon.hlsl"
+/* ----------------------------------------------- Height Range Tex ----------------------------------------------- */
+
+Texture2D<float> Heightmap;
+RWTexture2D<float2> HeightRangeTex;
+
+[numthreads (8, 8, 1)]
+void CSGenerateHeightRangeMip0(int3 dispatchThreadID : SV_DispatchThreadID)
+{
+    int2 id = dispatchThreadID.xy;
+    float height = Heightmap.Load(int3(id, 0)).r;
+    HeightRangeTex[id] = float2(height, height);
+}
+
+
+RWTexture2D<float2> SrcHeightRangeTexMip;
+RWTexture2D<float2> DestHeightRangeTexMip;
+
+[numthreads (8, 8, 1)]
+void CSGenerateHeightRangeMipDown(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    uint2 destTexelID = dispatchThreadID.xy;
+    uint2 srcTexelBaseID = destTexelID * 2; 
+    
+    float2 height00 = SrcHeightRangeTexMip.Load(srcTexelBaseID).rg;
+    float2 height01 = SrcHeightRangeTexMip.Load(srcTexelBaseID + uint2(0, 1)).rg;
+    float2 height10 = SrcHeightRangeTexMip.Load(srcTexelBaseID + uint2(1, 0)).rg;
+    float2 height11 = SrcHeightRangeTexMip.Load(srcTexelBaseID + uint2(1, 1)).rg;
+    
+    float minHeight = min(min(height00.r, height01.r), min(height10.r, height11.r));
+    float maxHeight = max(max(height00.g, height01.g), max(height10.g, height11.g));
+    
+    DestHeightRangeTexMip[destTexelID] = float2(minHeight, maxHeight);
+}
+
+/* ----------------------------------------------- cull data buffer ------------------------------------------------- */
+RWStructuredBuffer<TerrainNodeAABB> TerrainNodeAABBBuffer;
+Texture2D<float2> AABBHeightRangeLUT;
+uint BufferCurrLevelStartIndex;
+
+float HeightScale;
+uint RootLevelMip;  // the HeightRangeTex mip level at the root level of quad tree
+
+// The following "RootLevelNodeSize" and "RootLevelSideNodes" are used to calculate the swizzled current node's index in the flattened buffer (for better quad tree lookup), 
+uint RootLevelSideNodes; // the number of the root nodes in each side in the base quad tree level
+uint CurrLevelSideNodes; // this level of quad tree contains {levelSideNodeCount * levelSideNodeCount} nodes
+float CurrLevelNodeHalfSize;    // Each node covers a square area in the world, nodeHalfSizeWorld is half of the square's side length
+uint CurrLevel;  // The Quadtree level, NOT heightmap mip level!!! We are filling AABB of the quad tree nodes in "CurrLevel" into the buffer
+
+[numthreads (8, 1, 8)]
+void CSGenerateTerrainNodeAABBBuffer(uint3 dispatchThreadID : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex, uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
+{
+    if (dispatchThreadID.x >= CurrLevelSideNodes || dispatchThreadID.z >= CurrLevelSideNodes)
+    {
+        return;
+    }
+    
+    static uint startIdx = BufferCurrLevelStartIndex;
+    static uint currMipLevel = RootLevelMip - CurrLevel;
+    
+    float nodeCenterX = dispatchThreadID.x * (2 * CurrLevelNodeHalfSize) + CurrLevelNodeHalfSize;
+    float nodeCenterZ = dispatchThreadID.z * (2 * CurrLevelNodeHalfSize) + CurrLevelNodeHalfSize;
+    float2 AABBHeightRange = AABBHeightRangeLUT.Load(uint3(dispatchThreadID.xz, currMipLevel)).rg * HeightScale;
+    float nodeCenterY = (AABBHeightRange.g + AABBHeightRange.r) / 2;
+    float nodeHalfSizeY = (AABBHeightRange.g - AABBHeightRange.r) / 2;           
+
+    TerrainNodeAABB ret = {
+        CurrLevelNodeHalfSize,
+        nodeHalfSizeY,
+        CurrLevelNodeHalfSize,
+        nodeCenterX,
+        nodeCenterY,
+        nodeCenterZ,
+    };
+    
+    uint bufferIndex = startIdx;
+    uint2 currIndex = dispatchThreadID.xz;
+    
+    // The root level does not swizzle
+    if (CurrLevel == 0)
+    {
+        bufferIndex += currIndex.x * RootLevelSideNodes + currIndex.y;
+        TerrainNodeAABBBuffer[bufferIndex] = ret;
+        return;
+    }
+
+    // swizzle the children index by recursively iterating from root and add to bufferIndex
+    uint parentNodeTexelSize = 1 << CurrLevel;
+    uint currLevelSideNodes = RootLevelSideNodes; // we consider level 0 as a giant node and has "RootLevelSideNodes" of child nodes on each side,
+
+    uint2 parentIndex = currIndex / parentNodeTexelSize;
+    uint parentNodeTotalTexels = parentNodeTexelSize * parentNodeTexelSize;
+    bufferIndex += parentIndex.x * currLevelSideNodes * parentNodeTotalTexels + parentIndex.y * parentNodeTotalTexels;
+    
+    currLevelSideNodes = 2; // after the root level, each node will only contain 2x2=4 child nodes
+    currIndex %= parentNodeTexelSize;
+    parentNodeTexelSize /= 2;
+    /*
+     *          11 12  15 16
+     *          9  10  13 14
+     * 3 4  ->  3  4   7  8
+     * 1 2  ->  1  2   5  6
+     * 
+     */
+    for (uint l = 1; l <= CurrLevel; ++l)
+    {
+        parentIndex = currIndex / parentNodeTexelSize;
+        parentNodeTotalTexels = parentNodeTexelSize * parentNodeTexelSize;
+        bufferIndex += parentIndex.x * parentNodeTotalTexels + parentIndex.y * currLevelSideNodes * parentNodeTotalTexels;
+
+        currIndex %= parentNodeTexelSize;
+        parentNodeTexelSize /= 2;
+    }
+    TerrainNodeAABBBuffer[bufferIndex] = ret;
+}
+
+
+
+/* ----------------------------------------------- node data buffer ----------------------------------------------- */
+StructuredBuffer<TerrainNodeAABB> TerrainNodeAABBBufferRead;
+struct TerrainNodeData
+{
+    float positionX;
+    float positionZ;
+    float scale;
+};
+RWStructuredBuffer<TerrainNodeData> TerrainNodeDataBuffer;
+
+uint bufferSize;
+
+// This buffer will be used in terrain shading
+[numthreads(64, 1, 1)]
+void CSGenerateTerrainNodeDataBuffer(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    if (dispatchThreadID.x >= bufferSize)
+    {
+        return;
+    }
+
+    uint id = dispatchThreadID.x;
+    TerrainNodeAABB AABB = TerrainNodeAABBBufferRead[id];
+
+    TerrainNodeDataBuffer[id].positionX = AABB.position.x;
+    TerrainNodeDataBuffer[id].positionZ = AABB.position.z;
+    TerrainNodeDataBuffer[id].scale = 2 * AABB.extent.x / 16;  // 16 is the size of the base patch mesh
+}
+#endif

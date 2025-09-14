@@ -1,0 +1,216 @@
+#pragma kernel CSCullPassResultArgReset
+#pragma kernel CSTerrainNextLevelCandidateReset
+#pragma kernel CSTerrainNextLevelCandidate
+
+// #pragma enable_d3d11_debug_symbols
+
+#include "ClipmapTerrainCommon.hlsl"
+
+#define PATCH_MESH_INDIRECT_ARGUMENTS_LENGTH 5
+#define PATCH_MESH_INDIRECT_ARGUMENTS_INSTANCE_COUNT_LOCATION 1
+
+// #define CULLING
+
+RWBuffer<uint> PatchMeshIndirectArgs;
+
+uint TotalRenderBatchCount; // batched draws of same LOD? Our demo has only one batch
+
+[numthreads(16, 1, 1)]
+void CSCullPassResultArgReset (uint3 id : SV_GroupThreadID)
+{
+    if (id.x < TotalRenderBatchCount)
+    {
+        PatchMeshIndirectArgs[
+            id.x * PATCH_MESH_INDIRECT_ARGUMENTS_LENGTH
+            + PATCH_MESH_INDIRECT_ARGUMENTS_INSTANCE_COUNT_LOCATION] = 0;
+    }
+}
+
+RWStructuredBuffer<uint> TerrainCurrLevelCandidate;
+RWStructuredBuffer<uint> TerrainNextLevelCandidate;
+float4 _TerrainOffset; // The origin (bottom left corner of the terrain) in world space.
+
+cbuffer PerDispatchUpdate 
+{
+    // Camera data
+    float4 _CamPosition;
+    float4 _CamPositionSnapped;
+    float _CurrTerrainLODLevelSize;
+    float _LastTerrainLODDistance;
+    float _CurrTerrainLODDistance;
+    int _CurrLODArgOffset;
+    int _CurrLODIndexBase;
+    int _NextLODIndexBase;
+}
+
+cbuffer PerFrameUpdate
+{
+    float4 _FrustumPlanes[6];
+    float3 _FrustumMinPoint;
+    float3 _FrustumMaxPoint;
+}
+
+
+// Stores the leaf nodes id and their mesh stitching info, after iterations of the quad tree traversal.
+// These nodes are the ones that will be rendered.
+RWStructuredBuffer<TerrainCullResultData> TerrainCullResultDataBuffer;
+
+
+// Precalculated aabb for every node in the terrain quad tree
+StructuredBuffer<TerrainNodeAABB> TerrainNodeAABBBuffer;
+
+
+[numthreads(1, 1, 1)]
+void CSTerrainNextLevelCandidateReset()
+{
+    TerrainNextLevelCandidate[0] = 0;
+}
+
+
+float VisibilityTest(float3 position, float3 extent);
+
+
+[numthreads(64, 1, 1)]
+void CSTerrainNextLevelCandidate(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    if (dispatchThreadID.x >= TerrainCurrLevelCandidate[0]) { return; }
+    
+    int nodeId = TerrainCurrLevelCandidate[dispatchThreadID.x + 1];
+    TerrainNodeAABB nodeAABBInfo = TerrainNodeAABBBuffer[nodeId];
+    float3 nodePos = nodeAABBInfo.position + _TerrainOffset.xyz;
+    float3 nodeHalfSize = nodeAABBInfo.extent;
+
+
+    float visible = VisibilityTest(nodePos, nodeHalfSize);
+    if (!visible) { return; }
+    
+    // Subdivision
+    float2 nodeDistToCam = nodePos.xz - _CamPositionSnapped.xy;
+    float2 closestCornerDistToCam = abs(nodeDistToCam) - 0.5 * float2(_CurrTerrainLODLevelSize, _CurrTerrainLODLevelSize);
+    float maxCoord = max(closestCornerDistToCam.x, closestCornerDistToCam.y);
+    
+    // The following operation is not redundant! The last TerrainLODDistance will be set to 0,
+    // sending all candidates to final node lists with proper lod transition
+    maxCoord = max(maxCoord, 0.0);  
+    
+    bool insideClipmap = maxCoord < _CurrTerrainLODDistance;
+    if (insideClipmap)
+    {
+        uint childNodeBufferIndexBase;
+        InterlockedAdd(TerrainNextLevelCandidate[0], 4u, childNodeBufferIndexBase);
+        
+        // the 0th element in the buffer is the counter, we should start writing nodes from index 1
+        childNodeBufferIndexBase += 1;  
+        
+        uint childNodeIDBase = (nodeId - _CurrLODIndexBase) << 2;
+        childNodeIDBase += _NextLODIndexBase;
+        
+        uint4 childrenBufferIndex = childNodeBufferIndexBase.xxxx   + uint4(0, 1, 2, 3);
+        uint4 childrenID =          childNodeIDBase.xxxx            + uint4(0, 1, 2, 3);
+        
+        TerrainNextLevelCandidate[childrenBufferIndex.x] = uint(childrenID.x);
+        TerrainNextLevelCandidate[childrenBufferIndex.y] = uint(childrenID.y);
+        TerrainNextLevelCandidate[childrenBufferIndex.z] = uint(childrenID.z);
+        TerrainNextLevelCandidate[childrenBufferIndex.w] = uint(childrenID.w);
+    }
+    else
+    {
+        uint instanceCountLocation = _CurrLODArgOffset + PATCH_MESH_INDIRECT_ARGUMENTS_INSTANCE_COUNT_LOCATION;
+        uint leafNodeInfoBufferLocation;
+        InterlockedAdd(PatchMeshIndirectArgs[instanceCountLocation], 1u, leafNodeInfoBufferLocation);
+        
+        uint nodeRelativeID = (nodeId - _CurrLODIndexBase) & 3; // % 4
+        uint nodeRelativeIDEncoding = 1 << nodeRelativeID;
+        /*  nodeID  ==>  encoding          
+          2  3      ==>  4  8
+          0  1           1  2
+        */
+        static const uint isRightNode   = 2 | 8;
+        static const uint isLeftNode    = 1 | 4;
+        static const uint isTopNode     = 4 | 8;
+        static const uint isBottomNode  = 1 | 2;
+        
+        uint lodTransitionInfo = 0;
+        float2 outerCornerDistance = closestCornerDistToCam + _CurrTerrainLODLevelSize;
+        if (outerCornerDistance.x >= _LastTerrainLODDistance)
+        {
+            if (nodeDistToCam.x > 0)
+            {
+                if (nodeRelativeIDEncoding & isRightNode)
+                {
+                    lodTransitionInfo += rightEncoding;
+                }
+            } 
+            else 
+            {
+                if (nodeRelativeIDEncoding & isLeftNode)
+                {
+                    lodTransitionInfo += leftEncoding;
+                }
+            }
+        }
+        if (outerCornerDistance.y >= _LastTerrainLODDistance)
+        {
+            if (nodeDistToCam.y > 0)
+            {
+                if (nodeRelativeIDEncoding & isTopNode)
+                {
+                    lodTransitionInfo += topEncoding;
+                }
+            }
+            else 
+            {
+                if (nodeRelativeIDEncoding & isBottomNode)
+                {
+                    lodTransitionInfo += bottomEncoding;
+                }
+            }
+        }
+        
+        TerrainCullResultDataBuffer[leafNodeInfoBufferLocation].id = nodeId;
+        TerrainCullResultDataBuffer[leafNodeInfoBufferLocation].lodTransition = lodTransitionInfo;
+    }
+}
+
+
+float VisibilityTest(float3 position, float3 extent)
+{
+    // Coarse frustum culling by AABB
+    float3 nodeAABBMax = position + extent;
+    float3 nodeAABBMin = position - extent;
+    float outOfRange = dot(_FrustumMinPoint > nodeAABBMax, 1) + dot(_FrustumMaxPoint < nodeAABBMin, 1);
+    
+    if (outOfRange > 0.5)
+    {
+        return 0;
+    }
+
+    // Fine frustum culling by frustum planes
+    [unroll]
+    for (uint i = 0; i < 6; ++i)
+    {
+        float4 plane = _FrustumPlanes[i];
+        float3 planeNormal = plane.xyz;
+        float3 absPlaneNormal = abs(planeNormal);
+        float planeSignedDistFromOrigin = -plane.w; // the signed distance from origin to this plane along the plane's normal
+
+        // TODO: it sometimes culls visible tiles near cliff, we add a bias of 0.5 as a temporary fix, need to figure out later.
+        /* Cam data {
+         *    Position: Vector3(1594.49817,210.308884,237.532013)
+         *    Rotation: Vector3(343.550049,44.9007301,0)
+         *      }
+         */
+        // [Update] It's NOT caused by mesh stitching since the stitching points lie within the bounding box
+        
+        float bias = 0.5;
+        if (dot(position, planeNormal) + dot(absPlaneNormal, extent) + bias < planeSignedDistFromOrigin) 
+        {
+            return 0;
+        }
+    }
+
+    // TODO: Hierarchical Z Culling
+
+    return 1;
+}
+
